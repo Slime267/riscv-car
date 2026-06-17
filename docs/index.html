@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>RISC-V 遥控小车</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0f0f23;color:#ccc;font-family:system-ui;display:flex;flex-direction:column;
+       align-items:center;height:100dvh;touch-action:none;overflow:hidden;
+       user-select:none;-webkit-user-select:none}
+  h2{margin:12px 0 4px;font-size:18px}
+  #status{font-size:12px;margin-bottom:8px;padding:4px 14px;border-radius:12px;background:#1a1a3e}
+  #status.ok{color:#0f0}
+  button{padding:12px 40px;font-size:16px;border:none;border-radius:25px;margin:6px 0;cursor:pointer}
+  #btnConnect{background:#e94560;color:#fff}
+  #btnConnect.connected{background:#0a8;color:#fff}
+  #dpad{display:grid;grid-template-columns:70px 70px 70px;grid-template-rows:70px 70px 70px;
+         gap:4px;margin:12px 0}
+  .btn{background:#1a1a3e;border:2px solid #2a2a5e;border-radius:14px;
+       font-size:30px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+  .btn:active,.btn.pressed{background:#e94560;border-color:#ff6b81}
+  .empty{visibility:hidden}
+  #stop{background:#333;border-color:#555}
+  label{font-size:13px;margin-top:8px}
+  input[type=range]{width:85%;margin:4px 0 12px;accent-color:#e94560}
+  .telemetry{display:flex;gap:16px;font-size:13px;margin:4px 0;color:#aaa}
+  .telemetry span{background:#1a1a3e;padding:3px 10px;border-radius:8px}
+  .info{font-size:12px;color:#888;margin-top:4px}
+</style>
+</head>
+<body>
+
+<h2>RISC-V 遥控小车</h2>
+<div id="status">未连接</div>
+<button id="btnConnect" onclick="toggleBLE()">连接小车</button>
+
+<input type="range" id="speed" min="30" max="100" value="70" oninput="updateLabel()">
+<label>速度: <span id="lbl">70</span>%</label>
+
+<div id="dpad">
+  <div class="empty"></div>
+  <div class="btn" id="btnFwd">▲</div>
+  <div class="empty"></div>
+  <div class="btn" id="btnLeft">◀</div>
+  <div class="btn" id="stop">■</div>
+  <div class="btn" id="btnRight">▶</div>
+  <div class="empty"></div>
+  <div class="btn" id="btnBack">▼</div>
+  <div class="empty"></div>
+</div>
+
+<div class="telemetry">
+  <span>⚡ L:<span id="spdL">0</span>% R:<span id="spdR">0</span>%</span>
+  <span>🔋 <span id="bat">--</span>%</span>
+</div>
+
+<button style="background:#333;font-size:13px;padding:8px 20px;margin-top:4px" onclick="toggleLED()">
+  LED 开关
+</button>
+<div class="info">使用 Chrome/Edge 浏览器打开 | ESP32-C3 RISC-V</div>
+
+<script>
+let dev, charCtrl, charStatus, spd = 0.7, led = 0;
+
+document.getElementById('speed').value = 70;
+updateLabel();
+
+function updateLabel(){
+  spd = document.getElementById('speed').value / 100;
+  document.getElementById('lbl').textContent = Math.round(spd*100);
+}
+
+function setStatus(t,s){let e=document.getElementById('status');e.textContent=t;e.className=s||''}
+
+// ---- BLE 连接 ----
+async function toggleBLE(){
+  if(dev && dev.gatt.connected){dev.gatt.disconnect();return}
+  try{
+    setStatus('扫描中...');
+    dev = await navigator.bluetooth.requestDevice({
+      filters:[{name:'RISC-V Car'}],
+      optionalServices:['0000ffe0-0000-1000-8000-00805f9b34fb']
+    });
+    dev.addEventListener('gattserverdisconnected',()=>{
+      setStatus('已断开');document.getElementById('btnConnect').textContent='连接小车';
+      document.getElementById('btnConnect').classList.remove('connected');
+    });
+    let srv = await dev.gatt.connect();
+    let svc = await srv.getPrimaryService('0000ffe0-0000-1000-8000-00805f9b34fb');
+    charCtrl = await svc.getCharacteristic('0000ffe1-0000-1000-8000-00805f9b34fb');
+
+    // 订阅状态通知 (小车→手机: 速度%, 电量%, 连接状态)
+    charStatus = await svc.getCharacteristic('0000ffe2-0000-1000-8000-00805f9b34fb');
+    await charStatus.startNotifications();
+    charStatus.addEventListener('characteristicvaluechanged', e => {
+      let d = new Uint8Array(e.target.value.buffer);
+      document.getElementById('spdL').textContent = d[0];
+      document.getElementById('spdR').textContent = d[1];
+      document.getElementById('bat').textContent = d[2];
+    });
+    setStatus('已连接','ok');
+    document.getElementById('btnConnect').textContent='断开连接';
+    document.getElementById('btnConnect').classList.add('connected');
+  }catch(e){
+    setStatus('连接失败:'+e.message);console.error(e)
+  }
+}
+
+// ---- 发送指令 ----
+function send(l,r,extra){
+  if(!charCtrl)return;
+  let a=new Uint8Array([l,r,extra||0]);
+  charCtrl.writeValueWithoutResponse(a).catch(()=>{})
+}
+
+// ---- 方向控制 ----
+function cmd(l,r){
+  let s=Math.round(spd*127); // 70% → 89
+  if(l>0)l=s;else if(l<0)l=-s; // -s 表示反转
+  if(r>0)r=s;else if(r<0)r=-s;
+  send(l,r);
+}
+
+// 触摸事件 (pointerdown/up/leave 支持按住不放)
+function bind(id, l, r){
+  let el=document.getElementById(id);
+  el.addEventListener('pointerdown',e=>{e.preventDefault();cmd(l,r);el.classList.add('pressed')});
+  el.addEventListener('pointerup',  e=>{e.preventDefault();cmd(0,0);el.classList.remove('pressed')});
+  el.addEventListener('pointerleave',e=>{cmd(0,0);el.classList.remove('pressed')});
+}
+
+bind('btnFwd',   1,  1);  // 前进
+bind('btnBack', -1, -1);  // 后退
+bind('btnLeft',  0,  1);  // 左转 (左轮停 右轮前进)
+bind('btnRight', 1,  0);  // 右转 (右轮停 左轮前进)
+bind('stop',     0,  0);  // 停止
+
+function toggleLED(){led^=1;send(0,0,led)}
+</script>
+</body>
+</html>
