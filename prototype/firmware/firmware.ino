@@ -84,10 +84,10 @@ class CtrlCallback : public BLECharacteristicCallbacks {
     // UTF-8 文本指令
     if (d[0] >= 'A' && d[0] <= 'z') {
       switch (d[0]) {
-        case 'F': motor_l =  spd; motor_r =  spd; break;
-        case 'B': motor_l = -spd; motor_r = -spd; break;
-        case 'L': motor_l =  spd; motor_r = -spd; break;
-        case 'R': motor_l = -spd; motor_r =  spd; break;
+        case 'F': motor_l =  spd; motor_r = -spd; break;
+        case 'B': motor_l = -spd; motor_r =  spd; break;
+        case 'L': motor_l = -spd; motor_r = -spd; break;
+        case 'R': motor_l =  spd; motor_r =  spd; break;
         case 'S': motor_l =  0;   motor_r =  0;   break;
       }
       return;
@@ -98,7 +98,7 @@ class CtrlCallback : public BLECharacteristicCallbacks {
     int raw_l = (int8_t)d[0];
     int raw_r = (int8_t)d[1];
     motor_l = (raw_l * MAX_PWM) / 127;
-    motor_r = (raw_r * MAX_PWM) / 127;
+    motor_r = -(raw_r * MAX_PWM) / 127;  // 右电机镜像
 
     if (abs(motor_l) < MIN_PWM) motor_l = 0;
     if (abs(motor_r) < MIN_PWM) motor_r = 0;
@@ -146,7 +146,7 @@ void set_motor(int en, int in1, int in2, int speed) {
 
 void update_motors() {
   set_motor(PIN_ENA, PIN_IN1, PIN_IN2,  motor_l);              // 左电机
-  set_motor(PIN_ENB, PIN_IN3, PIN_IN4, -motor_r * 90 / 100);   // 右电机 90% 修正跑偏
+  set_motor(PIN_ENB, PIN_IN3, PIN_IN4,  motor_r * 90 / 100);   // 右电机 90% 修正跑偏
 }
 
 // ==================== 电源指示 (无分压电阻, 跳过 ADC) ====================
