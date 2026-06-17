@@ -132,8 +132,8 @@ function bind(id, l, r){
 
 bind('btnFwd',   1,  1);  // 前进
 bind('btnBack', -1, -1);  // 后退
-bind('btnLeft', -1,  1);  // 左转 (左轮后 右轮前)
-bind('btnRight', 1, -1);  // 右转 (左轮前 右轮后)
+bind('btnLeft',  1, -1);  // 左转
+bind('btnRight',-1,  1);  // 右转
 bind('stop',     0,  0);  // 停止
 
 function toggleLED(){led^=1;send(0,0,led)}
