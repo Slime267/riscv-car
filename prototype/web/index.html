@@ -15,6 +15,8 @@
   button{padding:12px 40px;font-size:16px;border:none;border-radius:25px;margin:6px 0;cursor:pointer}
   #btnConnect{background:#e94560;color:#fff}
   #btnConnect.connected{background:#0a8;color:#fff}
+  #btnTilt{background:#333;color:#ccc;font-size:14px;padding:8px 20px}
+  #btnTilt.active{background:#e94560;color:#fff}
   #dpad{display:grid;grid-template-columns:70px 70px 70px;grid-template-rows:70px 70px 70px;
          gap:4px;margin:12px 0}
   .btn{background:#1a1a3e;border:2px solid #2a2a5e;border-radius:14px;
@@ -27,6 +29,7 @@
   .telemetry{display:flex;gap:16px;font-size:13px;margin:4px 0;color:#aaa}
   .telemetry span{background:#1a1a3e;padding:3px 10px;border-radius:8px}
   .info{font-size:12px;color:#888;margin-top:4px}
+  #tiltHint{font-size:12px;color:#e94560;margin:4px 0}
 </style>
 </head>
 <body>
@@ -34,6 +37,9 @@
 <h2>RISC-V 遥控小车</h2>
 <div id="status">未连接</div>
 <button id="btnConnect" onclick="toggleBLE()">连接小车</button>
+
+<div id="tiltHint" style="display:none">手机前倾=前进 / 左倾=左转 / 放平=停止</div>
+<button id="btnTilt" onclick="toggleTilt()">体感模式：关</button>
 
 <input type="range" id="speed" min="5" max="30" value="20" oninput="updateLabel()">
 <label>速度: <span id="lbl">20</span>%</label>
@@ -51,17 +57,15 @@
 </div>
 
 <div class="telemetry">
-  <span>⚡ L:<span id="spdL">0</span>% R:<span id="spdR">0</span>%</span>
+  <span>L:<span id="spdL">0</span>% R:<span id="spdR">0</span>%</span>
   <span>🔋 <span id="bat">--</span>%</span>
 </div>
 
-<button style="background:#333;font-size:13px;padding:8px 20px;margin-top:4px" onclick="toggleLED()">
-  LED 开关
-</button>
-<div class="info">使用 Chrome/Edge 浏览器打开 | ESP32-C3 RISC-V</div>
+<div class="info">Chrome/Edge | ESP32-C3 RISC-V</div>
 
 <script>
-let dev, charCtrl, charStatus, spd = 0.2, led = 0;
+let dev, charCtrl, charStatus, spd = 0.2, led = 0, tiltOn = false;
+let lastL = 0, lastR = 0;
 
 document.getElementById('speed').value = 20;
 updateLabel();
@@ -70,10 +74,9 @@ function updateLabel(){
   spd = document.getElementById('speed').value / 100;
   document.getElementById('lbl').textContent = Math.round(spd*100);
 }
-
 function setStatus(t,s){let e=document.getElementById('status');e.textContent=t;e.className=s||''}
 
-// ---- BLE 连接 ----
+// ---- BLE ----
 async function toggleBLE(){
   if(dev && dev.gatt.connected){dev.gatt.disconnect();return}
   try{
@@ -89,8 +92,6 @@ async function toggleBLE(){
     let srv = await dev.gatt.connect();
     let svc = await srv.getPrimaryService('0000ffe0-0000-1000-8000-00805f9b34fb');
     charCtrl = await svc.getCharacteristic('0000ffe1-0000-1000-8000-00805f9b34fb');
-
-    // 订阅状态通知 (小车→手机: 速度%, 电量%, 连接状态)
     charStatus = await svc.getCharacteristic('0000ffe2-0000-1000-8000-00805f9b34fb');
     await charStatus.startNotifications();
     charStatus.addEventListener('characteristicvaluechanged', e => {
@@ -107,36 +108,90 @@ async function toggleBLE(){
   }
 }
 
-// ---- 发送指令 ----
+// ---- 发送 ----
 function send(l,r,extra){
   if(!charCtrl)return;
+  if(l===lastL && r===lastR)return;  // 去重
+  lastL=l; lastR=r;
   let a=new Uint8Array([l,r,extra||0]);
   charCtrl.writeValueWithoutResponse(a).catch(()=>{})
 }
-
-// ---- 方向控制 ----
 function cmd(l,r){
-  let s=Math.round(spd*127); // 70% → 89
-  if(l>0)l=s;else if(l<0)l=-s; // -s 表示反转
+  let s=Math.round(spd*127);
+  if(l>0)l=s;else if(l<0)l=-s;
   if(r>0)r=s;else if(r<0)r=-s;
   send(l,r);
 }
 
-// 触摸事件 (pointerdown/up/leave 支持按住不放)
+// ---- 按键 ----
 function bind(id, l, r){
   let el=document.getElementById(id);
   el.addEventListener('pointerdown',e=>{e.preventDefault();cmd(l,r);el.classList.add('pressed')});
   el.addEventListener('pointerup',  e=>{e.preventDefault();cmd(0,0);el.classList.remove('pressed')});
   el.addEventListener('pointerleave',e=>{cmd(0,0);el.classList.remove('pressed')});
 }
-
-bind('btnFwd',   1,  1);  // 前进
-bind('btnBack', -1, -1);  // 后退
-bind('btnLeft', -1,  1);  // 左转 (左轮后 右轮前)
-bind('btnRight', 1, -1);  // 右转 (左轮前 右轮后)
-bind('stop',     0,  0);  // 停止
+bind('btnFwd',   1,  1);
+bind('btnBack', -1, -1);
+bind('btnLeft',  1, -1);
+bind('btnRight',-1,  1);
+bind('stop',     0,  0);
 
 function toggleLED(){led^=1;send(0,0,led)}
+
+// ---- 体感 ----
+function toggleTilt(){
+  tiltOn = !tiltOn;
+  let btn = document.getElementById('btnTilt');
+  let hint = document.getElementById('tiltHint');
+  if(tiltOn){
+    if(typeof DeviceOrientationEvent !== 'undefined' &&
+       typeof DeviceOrientationEvent.requestPermission === 'function'){
+      // iOS: 需要用户手势触发权限请求
+      DeviceOrientationEvent.requestPermission()
+        .then(r => {
+          if(r==='granted'){startTilt(); btn.textContent='体感模式：开'; btn.classList.add('active');
+                             hint.style.display='block'; }
+          else {tiltOn=false; alert('需要授权体感')}
+        })
+        .catch(()=>{tiltOn=false;alert('体感不支持')});
+    } else {
+      // Android: 直接监听
+      startTilt();
+      btn.textContent='体感模式：开';
+      btn.classList.add('active');
+      hint.style.display='block';
+    }
+  } else {
+    stopTilt();
+    btn.textContent='体感模式：关';
+    btn.classList.remove('active');
+    hint.style.display='none';
+    cmd(0,0);
+  }
+}
+
+function startTilt(){
+  window.addEventListener('deviceorientation', onTilt);
+}
+function stopTilt(){
+  window.removeEventListener('deviceorientation', onTilt);
+}
+
+function onTilt(e){
+  if(!tiltOn || !charCtrl)return;
+  let beta  = e.beta  || 0;   // 前后倾: 前倾 +
+  let gamma = e.gamma || 0;   // 左右倾: 右倾 +
+  let T = 10;  // 死区 10 度
+
+  let l=0, r=0;
+  if(beta > T){ l=1; r=1; }      // 前倾 → 前进
+  else if(beta < -T){ l=-1; r=-1; }  // 后倾 → 后退
+  else if(gamma < -T){ l=1; r=-1; }  // 左倾 → 左转
+  else if(gamma > T){ l=-1; r=1; }   // 右倾 → 右转
+  // 否则 l=0,r=0 → 停止
+
+  cmd(l, r);
+}
 </script>
 </body>
 </html>

@@ -1,5 +1,5 @@
 /*
- * RISC-V 无线遥控小车 — 固件 (适配 L298N + 2WD + TT 电机)
+ * RISC-V 无线遥控小车 — 固件 (L298N + 2WD + TT 电机 + OTA)
  * 芯片: 合宙 ESP32C3 经典版 (RISC-V 32-bit, 160MHz)
  * 环境: Arduino IDE 2.x + ESP32-C3 开发板支持
  *
@@ -13,15 +13,16 @@
  *   GPIO6  → SSD1306 SDA (I2C)
  *   GPIO7  → SSD1306 SCL (I2C)
  *   GPIO8  → 板载 LED
- *   GPIO0  → ADC 电池分压检测 (10K+20K)
  *
  * ============ 供电 ============
  *   电池 7.4V → MP1584(5V) → ESP32C3 5V + L298N 5V(逻辑, 拔跳线帽!)
  *   电池 7.4V → L298N 12V (电机供电)
  *   全部 GND 共地
  *
- * ============ 外设 ============
- *   BLE + PWM*2(ENA/ENB) + I2C(OLED) + ADC(电量) + GPIO(LED/IN1-4) = 5种
+ * ============ OTA 无线升级 ============
+ *   上电后自动启动 WiFi 热点 "RISC-V-OTA" (密码 12345678)
+ *   手机连此 WiFi → 浏览器打开 http://192.168.4.1
+ *   上传固件 .bin 文件 → 自动重启
  */
 
 #include <Arduino.h>
@@ -33,24 +34,22 @@
 #include <Adafruit_GFX.h>
 
 // ==================== L298N 引脚 ====================
-#define PIN_ENA 2  // 左电机 PWM
-#define PIN_IN1 3
-#define PIN_IN2 4
-#define PIN_ENB 5  // 右电机 PWM
-#define PIN_IN3 10
-#define PIN_IN4 1
+#define PIN_ENA 10  // 左电机 PWM
+#define PIN_IN1 6
+#define PIN_IN2 7
+#define PIN_ENB 8   // 右电机 PWM
+#define PIN_IN3 5
+#define PIN_IN4 4
 
 // ==================== 其他引脚 ====================
-#define PIN_I2C_SDA 6
-#define PIN_I2C_SCL 7
-#define PIN_LED 8
-// ADC 脚未用 (无分压电阻)
+#define PIN_I2C_SDA 3  // OLED SDA
+#define PIN_I2C_SCL 2  // OLED SCL
+#define PIN_LED 21     // 板载 LED
+#define PIN_BAT 0  // ADC 电池分压
 
 // ==================== 电机参数 ====================
-// L298N 压降 ~2V, 电池 7.4V → 电机实得 ≈ 5.4V
-// TT 电机额定 3-6V, 5.4V 在范围内, 无需限幅
 #define MAX_PWM 255
-#define MIN_PWM 12  // 死区, 5%
+#define MIN_PWM 12   // 死区, 5%
 
 // ==================== BLE UUID ====================
 #define SERVICE_UUID "0000ffe0-0000-1000-8000-00805f9b34fb"
@@ -79,7 +78,7 @@ class CtrlCallback : public BLECharacteristicCallbacks {
     size_t len = pChar->getLength();
     if (len < 1) return;
 
-    int spd = MAX_PWM * 50 / 100;  // 默认 50% 速度
+    int spd = MAX_PWM * 50 / 100;
 
     // UTF-8 文本指令
     if (d[0] >= 'A' && d[0] <= 'z') {
@@ -98,7 +97,7 @@ class CtrlCallback : public BLECharacteristicCallbacks {
     int raw_l = (int8_t)d[0];
     int raw_r = (int8_t)d[1];
     motor_l = (raw_l * MAX_PWM) / 127;
-    motor_r = -(raw_r * MAX_PWM) / 127;  // 右电机镜像
+    motor_r = -(raw_r * MAX_PWM) / 127;
 
     if (abs(motor_l) < MIN_PWM) motor_l = 0;
     if (abs(motor_r) < MIN_PWM) motor_r = 0;
@@ -107,7 +106,6 @@ class CtrlCallback : public BLECharacteristicCallbacks {
       led_on = !led_on;
       digitalWrite(PIN_LED, led_on ? HIGH : LOW);
     }
-
   }
 };
 
@@ -124,10 +122,6 @@ class SvrCallback : public BLEServerCallbacks {
 };
 
 // ==================== L298N 电机驱动 ====================
-// L298N 真值表:
-//   IN1=H IN2=L → 正转    IN1=L IN2=H → 反转
-//   IN1=L IN2=L → 刹车    IN1=H IN2=H → 刹车
-//   ENA = PWM 调速
 void set_motor(int en, int in1, int in2, int speed) {
   if (speed > 0) {
     digitalWrite(in1, HIGH);
@@ -139,24 +133,25 @@ void set_motor(int en, int in1, int in2, int speed) {
     analogWrite(en, -speed);
   } else {
     digitalWrite(in1, LOW);
-    digitalWrite(in2, LOW);  // 刹车 (不是惯性滑行)
+    digitalWrite(in2, LOW);
     analogWrite(en, 0);
   }
 }
 
 void update_motors() {
-  set_motor(PIN_ENA, PIN_IN1, PIN_IN2,  motor_l);              // 左电机
-  set_motor(PIN_ENB, PIN_IN3, PIN_IN4,  motor_r * 90 / 100);   // 右电机 90% 修正跑偏
+  set_motor(PIN_ENA, PIN_IN1, PIN_IN2,  motor_l);
+  set_motor(PIN_ENB, PIN_IN3, PIN_IN4,  motor_r);
 }
 
-// ==================== 电源指示 (无分压电阻, 跳过 ADC) ====================
+// ==================== 电源指示 ====================
 void check_power() {
   static uint32_t last = 0;
   if (millis() - last < 1000) return;
   last = millis();
-
-  bat_v = 5.0;    // MP1584 固定输出
-  bat_pct = 100;  // 无法实测, 显示正常
+  // 20K+10K 分压: Vbat = ADC电压 * (20+10)/10 = ADC电压 * 3
+  int adc = analogRead(PIN_BAT);
+  bat_v = adc * 3.9f / 4095.0f * 3.0f * 0.757f;
+  bat_pct = constrain((int)((bat_v - 6.6f) / (8.4f - 6.6f) * 100), 0, 100);
 }
 
 // ==================== BLE 遥测上报 ====================
@@ -192,26 +187,28 @@ void oled_update() {
   display.setCursor(0, 0);
   display.print(connected ? "BLE:OK" : "BLE:--");
   display.setCursor(56, 0);
-  display.print("L:");
-  display.print(spd_l);
-  display.print("%");
+  display.print("L:"); display.print(spd_l); display.print("%");
   display.setCursor(96, 0);
-  display.print("R:");
-  display.print(spd_r);
-  display.print("%");
+  display.print("R:"); display.print(spd_r); display.print("%");
 
   // 第 2 行: 方向指示
   display.setCursor(0, 10);
-  if (motor_l == 0 && motor_r == 0) display.print("STOP       ");
-  else if (motor_l > 0 && motor_r > 0) display.print(">>  FWD  >>");
-  else if (motor_l < 0 && motor_r < 0) display.print("<<  REV  <<");
-  else if (motor_l < motor_r) display.print("<<  LEFT   ");
-  else if (motor_l > motor_r) display.print("   RIGHT >>");
+  if (motor_l == 0 && motor_r == 0) {
+    display.print("STOP       ");
+  } else if (motor_l > 0 && motor_r > 0) {
+    display.print(">>  FWD  >>");
+  } else if (motor_l < 0 && motor_r < 0) {
+    display.print("<<  REV  <<");
+  } else if (motor_l < motor_r) {
+    display.print("<<  LEFT   ");
+  } else if (motor_l > motor_r) {
+    display.print("   RIGHT >>");
+  }
 
-  // 第 3 行: 电源
+  // 第 3 行: 电池
   display.setCursor(0, 22);
-  display.print("PWR: 5V MP1584");
-
+  display.print(bat_v, 1); display.print("V ");
+  display.print(bat_pct); display.print("%");
   if (connected) display.fillRect(123, 0, 5, 5, SSD1306_WHITE);
 
   display.display();
@@ -220,15 +217,9 @@ void oled_update() {
 // ==================== 初始化 ====================
 void setup() {
   // --- GPIO ---
-  pinMode(PIN_ENA, OUTPUT);
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_ENB, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
+  pinMode(PIN_ENA, OUTPUT); pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_ENB, OUTPUT); pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-
-  // ADC: 11dB 衰减, 量程 0-3.9V
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
@@ -245,34 +236,28 @@ void setup() {
 
   // --- 开机自检 ---
   for (int i = 0; i < 3; i++) {
-    digitalWrite(PIN_LED, HIGH);
-    delay(80);
-    digitalWrite(PIN_LED, LOW);
-    delay(80);
+    digitalWrite(PIN_LED, HIGH); delay(80);
+    digitalWrite(PIN_LED, LOW);  delay(80);
   }
 
   // --- BLE ---
   BLEDevice::init("RISC-V Car");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new SvrCallback());
-
   BLEService *pService = pServer->createService(SERVICE_UUID);
-
   pCharCtrl = pService->createCharacteristic(
     CHAR_CTRL_UUID,
     BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   pCharCtrl->setCallbacks(new CtrlCallback());
-
   pCharStatus = pService->createCharacteristic(
     CHAR_STATUS_UUID,
     BLECharacteristic::PROPERTY_NOTIFY);
   pCharStatus->addDescriptor(new BLE2902());
-
   pService->start();
   BLEAdvertising *pAdv = BLEDevice::getAdvertising();
   pAdv->addServiceUUID(SERVICE_UUID);
   pAdv->start();
-}
+
 
 // ==================== 主循环 ====================
 void loop() {
